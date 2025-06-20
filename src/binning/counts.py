@@ -3,7 +3,7 @@ import numpy as np
 from shapely import Point
 from scipy.spatial.distance import cdist
 
-from utils.utils import approx_circle
+from src.binning.utils import approx_circle
 
 from pandas._libs.missing import NAType
 

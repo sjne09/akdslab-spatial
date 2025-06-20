@@ -7,7 +7,7 @@ from skimage.color import rgb2gray
 from skimage.filters import threshold_otsu
 from tifffile import TiffFile, RESUNIT
 
-from utils.utils import approx_circle
+from src.binning.utils import approx_circle
 
 SCALE_FACTORS = {
     RESUNIT.INCH: 25.4,
