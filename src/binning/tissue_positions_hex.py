@@ -1,3 +1,4 @@
+import os
 from math import ceil, cos, pi
 
 import numpy as np
@@ -5,7 +6,7 @@ import pandas as pd
 import shapely
 from skimage.color import rgb2gray
 from skimage.filters import threshold_otsu
-from tifffile import TiffFile, RESUNIT
+from tifffile import RESUNIT, TiffFile
 
 from src.binning.utils import approx_circle
 
@@ -18,7 +19,7 @@ SCALE_FACTORS = {
 }
 
 
-def get_spot_grid(
+def get_hex_grid(
     d: float, distance: float, h: int, w: int
 ) -> list[tuple[int, int, int, int]]:
     """
@@ -28,10 +29,12 @@ def get_spot_grid(
     Parameters
     ----------
     d : float
-        The diameter of the spots, in pixels
+        The diameter of the spots, in pixels. For Visium this should
+        correspond to 55 um
 
     distance : float
-        The distance between spot centers, in pixels
+        The distance between spot centers, in pixels. For Visium this
+        should correspond to 100 um
 
     h : int
         The height of the image, in pixels
@@ -140,11 +143,11 @@ def contains_tissue(
     # get the avg luminance based on pixels within the circle
     aoi = cropped_img[mask]
     avg_luminance = aoi.mean()
-    return avg_luminance > thresh
+    return avg_luminance < thresh
 
 
 def get_tissue_positions(
-    d: float, distance: float, img: np.ndarray
+    d: float, distance: float, img: np.ndarray, out_dir: str
 ) -> pd.DataFrame:
     """
     Constructs a tissue positions matrix, replicating output from
@@ -171,7 +174,7 @@ def get_tissue_positions(
     pd.DataFrame
         A dataframe containing the tissue positions matrix
     """
-    spots = get_spot_grid(d, distance, *img.shape[:-1])
+    spots = get_hex_grid(d, distance, *img.shape[:-1])
 
     # get the luminance threshold for distinguishing f/g from b/g
     gscale = rgb2gray(img)
@@ -198,11 +201,13 @@ def get_tissue_positions(
             "pxl_col_in_fullres",
         ],
     )
-    df.to_csv("tissue_positions.csv")
+    df.to_csv(f"{out_dir}/tissue_positions.csv")
     return df
 
 
-def locs_from_tissue_positions(tissue_positions: pd.DataFrame) -> None:
+def locs_from_tissue_positions(
+    tissue_positions: pd.DataFrame, out_dir: str
+) -> None:
     """
     Converts a tissue positions matrix into the locs matrix expected
     by iStar.
@@ -230,36 +235,134 @@ def locs_from_tissue_positions(tissue_positions: pd.DataFrame) -> None:
         .where(tissue_positions["in_tissue"] == 1)
         .dropna()
     )
-    df.to_csv("locs-raw.tsv", index=False, sep="\t")
+    df.to_csv(f"{out_dir}/locs-raw.tsv", index=False, sep="\t")
+
+
+def visualize(
+    tissue_positions: pd.DataFrame,
+    img: str | TiffFile,
+    out_dir: str,
+    radius: float,
+    max_width: int = 2000,
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    from PIL import Image
+
+    if isinstance(img, str):
+        img = TiffFile(img)
+
+    img_array = img.asarray(0)
+    pil_img = Image.fromarray(img_array)
+
+    h, w = img_array.shape[:-1]
+    aspect_ratio = w / h
+    scale_ratio = max_width / w
+    max_height = max_width / aspect_ratio
+
+    # rescale image
+    pil_img.thumbnail((max_width, max_height))
+
+    # modify radius
+    rescaled_radius = radius * scale_ratio
+
+    # rescale_coords
+    tissue_positions["pxl_row_rescaled"] = (
+        (tissue_positions["pxl_row_in_fullres"] * scale_ratio)
+        .round(0)
+        .astype(int)
+    )
+    tissue_positions["pxl_col_rescaled"] = (
+        (tissue_positions["pxl_col_in_fullres"] * scale_ratio)
+        .round(0)
+        .astype(int)
+    )
+
+    # plot
+    _, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(pil_img)
+
+    coords = tissue_positions[
+        ["pxl_col_rescaled", "pxl_row_rescaled", "in_tissue"]
+    ].to_numpy()
+
+    for x, y, it in coords:
+        c = Circle(
+            (x, y),
+            facecolor="blue",
+            alpha=1 if it == 1 else 0,  # set opacity to 0 if not in tissue
+            radius=rescaled_radius,
+        )
+        ax.add_patch(c)
+
+    plt.savefig(f"{out_dir}/vis.png", dpi=300)
+
+
+def get_radius_in_px(mpp: float, r_in_um: float, out_dir: str) -> float:
+    r_in_px = r_in_um / mpp
+
+    with open(f"{out_dir}/radius-raw.txt", "w") as f:
+        f.write(str(r_in_px))
+
+    return r_in_px
+
+
+def get_mpp(tif: TiffFile, out_dir: str) -> float:
+    # get the scale factor to convert px/unit to um/px
+    scalef = SCALE_FACTORS[tif.pages[0].tags["ResolutionUnit"].value]
+
+    # XResolution is px per units in a (px, units) tuple
+    mpp = (
+        tif.pages[0].tags["XResolution"].value[1]  # units
+        / tif.pages[0].tags["XResolution"].value[0]  # px
+        * scalef
+    )
+
+    # correct for errors in image metadata
+    if mpp < 0.1:
+        mpp *= 10
+
+    with open(f"{out_dir}/pixel-size-raw.txt", "w") as f:
+        f.write(str(mpp))
+
+    return mpp
 
 
 if __name__ == "__main__":
-    sample_id = "TENX111"
+    sample_ids = ["TENX111", "TENX114", "TENX147", "TENX148", "TENX149"]
+    excl = {"TENX111", "TENX114"}
 
-    with TiffFile(
-        f"/opt/gpudata/sjne/HEST/data/wsis/{sample_id}.tif"
-    ) as slide:
-        # get the scale factor to convert px/unit to um/px
-        scalef = SCALE_FACTORS[slide.pages[0].tags["ResolutionUnit"].value]
+    for sample_id in sample_ids:
+        if sample_id in excl:
+            print(f"Skipping {sample_id}")
+            continue
 
-        # XResolution is px per units in a (px, units) tuple
-        um_per_px = (
-            slide.pages[0].tags["XResolution"].value[1]  # units
-            / slide.pages[0].tags["XResolution"].value[0]  # px
-            * scalef
-        )
-        d_in_um = 55
-        d_in_px = d_in_um / um_per_px
+        print(f"Processing {sample_id}...")
+        os.makedirs(sample_id, exist_ok=True)
 
-        with open("radius-raw.txt", "w") as f:
-            f.write(str(d_in_px / 2))
+        with TiffFile(
+            f"/opt/gpudata/sjne/HEST/data/wsis/{sample_id}.tif"
+        ) as slide:
+            d_in_um = 55
 
-        with open("pixel-size-raw.txt", "w") as f:
-            f.write(str(um_per_px))
+            um_per_px = get_mpp(slide, sample_id)
+            r_in_px = get_radius_in_px(um_per_px, d_in_um / 2, sample_id)
 
-        distance_in_um = 100
-        distance_in_px = distance_in_um / um_per_px
+            distance_in_um = 100
+            distance_in_px = distance_in_um / um_per_px
 
-        # get_tissue_positions(d_in_px, distance_in_px, slide.asarray(0))
+            print("Getting tissue positions")
+            tp = get_tissue_positions(
+                r_in_px * 2, distance_in_px, slide.asarray(0), sample_id
+            )
 
-    # locs_from_tissue_positions(pd.read_csv("TENX111/tissue_positions.csv"))
+            print("Building locs dataframe")
+            locs_from_tissue_positions(tp, sample_id)
+
+            tp = pd.read_csv(f"{sample_id}/tissue_positions.csv")
+
+            try:
+                print("Visualizing")
+                visualize(tp, slide, sample_id, r_in_px)
+            except Exception:
+                pass
