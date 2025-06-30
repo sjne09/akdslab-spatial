@@ -1,17 +1,24 @@
 import os
 from math import ceil, cos, pi
 
-import numpy as np
-import pandas as pd
+# import numpy as np
+import cupy as np
+
+# import pandas as pd
+import cudf as pd
 import shapely
-from skimage.color import rgb2gray
-from skimage.filters import threshold_otsu
+
+# from skimage.color import rgb2gray
+# from skimage.filters import threshold_otsu
 from tifffile import RESUNIT, TiffFile
+
+from cucim.skimage.color import rgb2gray
+from cucim.skimage.filters import threshold_otsu
 
 from src.binning.utils import approx_circle
 
 SCALE_FACTORS = {
-    RESUNIT.INCH: 25.4,
+    RESUNIT.INCH: 25.4e3,
     RESUNIT.CENTIMETER: 1.0e4,
     RESUNIT.MILLIMETER: 1.0e3,
     RESUNIT.MICROMETER: 1.0,
@@ -182,13 +189,15 @@ def get_tissue_positions(
 
     positions = np.zeros((len(spots), 5), dtype=np.int32)
     for i, (y, x, b, a) in enumerate(spots):
-        positions[i] = [
-            int(contains_tissue((a, b), d, gscale, thresh)),
-            y,
-            x,
-            b,
-            a,
-        ]
+        positions[i] = np.asarray(
+            [
+                int(contains_tissue((a, b), d, gscale, thresh)),
+                y,
+                x,
+                b,
+                a,
+            ]
+        )
 
     # structure into dataframe to save as csv
     df = pd.DataFrame(
@@ -330,7 +339,7 @@ def get_mpp(tif: TiffFile, out_dir: str) -> float:
 
 if __name__ == "__main__":
     sample_ids = ["TENX111", "TENX114", "TENX147", "TENX148", "TENX149"]
-    excl = {"TENX111", "TENX114"}
+    excl = {"TENX111", "TENX114", "TENX147"}
 
     for sample_id in sample_ids:
         if sample_id in excl:
@@ -353,13 +362,16 @@ if __name__ == "__main__":
 
             print("Getting tissue positions")
             tp = get_tissue_positions(
-                r_in_px * 2, distance_in_px, slide.asarray(0), sample_id
+                r_in_px * 2,
+                distance_in_px,
+                np.asarray(slide.asarray(0)),
+                sample_id,
             )
 
             print("Building locs dataframe")
             locs_from_tissue_positions(tp, sample_id)
 
-            tp = pd.read_csv(f"{sample_id}/tissue_positions.csv")
+            # tp = pd.read_csv(f"{sample_id}/tissue_positions.csv")
 
             try:
                 print("Visualizing")

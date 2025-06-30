@@ -4,10 +4,15 @@ from pathlib import Path
 from multiprocessing import Pool, Queue, current_process
 
 import numpy as np
+# import cupy as np
+
 import pandas as pd
+
+# import cudf as pd
 import pyarrow as pa
 from pandas._libs.missing import NAType
 from pyarrow.parquet import ParquetFile
+
 from scipy.spatial.distance import cdist
 from shapely import Point
 
@@ -57,6 +62,31 @@ def determine_spot(
     return pd.NA
 
 
+def determine_spots(
+    transcript: pd.DataFrame,
+    spots: pd.DataFrame,
+    spot_r,
+):
+    # calc distances
+    query = np.expand_dims(np.asarray(transcript[["he_x", "he_y"]].values), 1)
+    spot_coords = np.expand_dims(np.asarray(spots[["x", "y"]].values), 0)
+    distances = np.sqrt(np.sum(np.power(query - spot_coords, 2), axis=-1))
+
+    # find nearest spot for each entry in transcript
+    nearest_indices = np.argmin(distances, axis=-1)
+    nearest_distances = distances[
+        np.arange(len(nearest_indices)), nearest_indices
+    ]
+    # nearest_distances = np.min(distances, axis=-1)
+
+    # find points that are within spots
+    within_radius = nearest_distances <= spot_r
+
+    # assign spot ids to transcripts
+    transcript["spot_id"] = spots.iloc[nearest_indices]["spot"].values
+    transcript.loc[~within_radius, "spot_id"] = pd.NA
+
+
 def get_counts(
     transcript: pd.DataFrame,
     spots: pd.DataFrame,
@@ -88,10 +118,12 @@ def get_counts(
     )
 
     # get the spot id for each entry in the transcript matrix
-    transcript["spot_id"] = transcript.apply(
-        lambda row: determine_spot(row["he_x"], row["he_y"], spots, spot_r),
-        axis=1,
-    )
+    # transcript["spot_id"] = transcript.apply(
+    #     lambda row: determine_spot(row["he_x"], row["he_y"], spots, spot_r),
+    #     axis=1,
+    # )
+    determine_spots(transcript, spots, spot_r)
+    print(f"Process {idx}: Spot ids determined. Binning", flush=True)
 
     bins = transcript[["spot_id", "feature_name"]].copy()
     bins["count"] = 1
@@ -99,7 +131,6 @@ def get_counts(
         bins.groupby(["spot_id", "feature_name"]).agg("sum").reset_index()
     )
 
-    # spot_counts_df["count"] = spot_counts_df["count"].astype(int)
     counts = spot_counts_df.pivot(
         index="spot_id",
         columns="feature_name",
@@ -165,9 +196,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     sample_ids = ["TENX111", "TENX114", "TENX147", "TENX148", "TENX149"]
-    excl = {"TENX111"}
+    excl = {"TENX111", "TENX114"}
 
     for sample_id in sample_ids:
+        if sample_id in excl:
+            print(f"Skipping {sample_id}")
+            continue
+
+        print(f"Processing {sample_id}...")
         locs = pd.read_csv(f"{sample_id}/locs-raw.tsv", sep="\t")
 
         with open(f"{sample_id}/radius-raw.txt", "r") as f:
