@@ -1,29 +1,46 @@
 import os
 from math import ceil, cos, pi
 
-# import numpy as np
-import cupy as np
-
-# import pandas as pd
-import cudf as pd
-import shapely
-
-# from skimage.color import rgb2gray
-# from skimage.filters import threshold_otsu
-from tifffile import RESUNIT, TiffFile
-
-from cucim.skimage.color import rgb2gray
+import cudf
+import cupy as cp
 from cucim.skimage.filters import threshold_otsu
+from PIL import Image
+from skimage.color import rgb2gray  # cpu to avoid OOM for large images
+from tifffile import TiffFile
 
-from src.binning.utils import approx_circle
+from src.binning.utils import (
+    get_mpp,
+    locs_from_tissue_positions,
+)
 
-SCALE_FACTORS = {
-    RESUNIT.INCH: 25.4e3,
-    RESUNIT.CENTIMETER: 1.0e4,
-    RESUNIT.MILLIMETER: 1.0e3,
-    RESUNIT.MICROMETER: 1.0,
-    RESUNIT.NONE: 1.0,
-}
+
+def get_radius_in_px(mpp: float, r_in_um: float, out_dir: str) -> float:
+    """
+    Converts the radius from microns to pixels based on the
+    microns-per-pixel (mpp) value.
+
+    Parameters
+    ----------
+    mpp : float
+        Microns per pixel value for the image
+
+    r_in_um : float
+        Radius in microns
+
+    out_dir : str
+        The directory to save the radius value to
+
+    Returns
+    -------
+    float
+        The radius in pixels
+    """
+    r_in_px = r_in_um / mpp
+
+    with open(f"{out_dir}/radius-raw.txt", "w") as f:
+        f.write(str(r_in_px))
+
+    return r_in_px
 
 
 def get_hex_grid(
@@ -61,11 +78,8 @@ def get_hex_grid(
 
     # the number of rows and cols of spots are defined in terms of the input
     # params
-    # FIXME maybe int not necessary?
     i_max = int(h / (distance * cos(pi / 6)))
     j_max = int(w / distance)
-
-    # fig, ax = plt.subplots(figsize=(10, 10))
 
     spots = []
     for i in range(i_max):
@@ -82,36 +96,29 @@ def get_hex_grid(
             x = x_0 + j * 2
             y = i
             spots.append((y, x, b, a))
-            # circle = plt.Circle((a, b), radius=55 / 2, color="r")
-            # ax.add_patch(circle)
-
-    # ax.set_xlim(0, 6500)
-    # ax.set_ylim(0, 6500)
-    # plt.savefig("test.png")
 
     return spots
 
 
 def contains_tissue(
     O: tuple[int, int],  # noqa: E741
-    d: float,
-    img: np.ndarray,
+    r: float,
+    img: cp.ndarray,
     thresh: float,
-) -> bool:
+) -> int:
     """
-    Determine if spot contains tissue using Otsu's method.
+    Determine if a spot contains tissue using Otsu's method.
 
     Parameters
     ----------
     O : tuple[int, int]
-        The spot center slide coordinates as (x, y)
+        The coordinates for the center of the spot, in pixels
 
-    d : int
-        The diameter of the spot, in pixels
+    r : float
+        The radius of the spot, in pixels
 
-    img : np.ndarray
-        The grayscale image to check for tissue within the spot;
-        shape [h, w]
+    img : cp.ndarray
+        The grayscale image to check for tissue within the spot
 
     thresh : float
         The luminance threshold for distinguishing foreground from
@@ -119,43 +126,41 @@ def contains_tissue(
 
     Returns
     -------
-    bool
-        Whether a spot contains tissue
+    int
+        Binary indicator of whether a spot contains tissue. 1 if it
+        does, 0 otherwise
     """
-    if len(img.shape) != 2:
-        raise ValueError("`img` must be a grayscale image")
-
     a, b = O
+    h, w = img.shape
 
-    # approximate the circle
-    circle = approx_circle(a, b, d / 2)
-    minx, miny, maxx, maxy = circle.bounds
+    # bbox for spot
+    x_min = max(0, int(a - r - 1))
+    x_max = min(w, int(a + r + 2))
+    y_min = max(0, int(b - r - 1))
+    y_max = min(h, int(b + r + 2))
 
-    # crop the image to the bounds of the circle
-    cropped_img = img[int(miny) : int(maxy) + 1, int(minx) : int(maxx) + 1]
-
-    # create a mask over the cropped image for pixels within the circle;
-    # adjust the point for `contains` to the original image coords using
-    # the circle's minx and miny
-    mask = np.array(
-        [
-            [
-                circle.contains(shapely.Point(x + int(minx), y + int(miny)))
-                for x in range(cropped_img.shape[1])
-            ]
-            for y in range(cropped_img.shape[0])
-        ]
+    # get all possible points within spot bbox (cartesian prod)
+    y_coords, x_coords = cp.meshgrid(
+        cp.arange(y_min, y_max), cp.arange(x_min, x_max), indexing="ij"
     )
 
-    # get the avg luminance based on pixels within the circle
-    aoi = cropped_img[mask]
-    avg_luminance = aoi.mean()
-    return avg_luminance < thresh
+    # calc distances between each point and the circle center
+    distances = cp.sqrt(cp.power(x_coords - a, 2) + cp.power(y_coords - b, 2))
+
+    # create a mask to identify points within spot circle
+    mask = distances <= r
+
+    # get avg luminance within grayscale patch; set tissue based on lum.
+    # and threshold
+    if cp.any(mask):
+        region = img[y_min:y_max, x_min:x_max]
+        avg_luminance = region[mask].mean()
+        return int(avg_luminance < thresh)
 
 
 def get_tissue_positions(
-    d: float, distance: float, img: np.ndarray, out_dir: str
-) -> pd.DataFrame:
+    d: float, distance: float, img: cp.ndarray, out_dir: str
+) -> cudf.DataFrame:
     """
     Constructs a tissue positions matrix, replicating output from
     Visium. The matrix will be saved to a csv called
@@ -171,36 +176,38 @@ def get_tissue_positions(
     distance : float
         The distance between spot centers, in pixels
 
-    img : np.ndarray
+    img : cp.ndarray
         The full resolution image to build the matrix from;
         shape [h, w, c] where c is the number of channels
         (e.g. 3 for RGB)
 
+    out_dir : str
+        The directory to save the output to
+
     Returns
     -------
-    pd.DataFrame
+    cudf.DataFrame
         A dataframe containing the tissue positions matrix
     """
     spots = get_hex_grid(d, distance, *img.shape[:-1])
+    print("Hex grid created; calculating tissue flags")
 
     # get the luminance threshold for distinguishing f/g from b/g
-    gscale = rgb2gray(img)
+    img_cpu = cp.asnumpy(img)  # send img to cpu; delete from gpu
+    del img
+
+    gscale = rgb2gray(img_cpu)
+    gscale = cp.array(gscale)  # move gscale to gpu
     thresh = threshold_otsu(gscale)
 
-    positions = np.zeros((len(spots), 5), dtype=np.int32)
+    # identify spots that contain tissue and form positions array
+    positions = cp.zeros((len(spots), 5), dtype=cp.int32)
     for i, (y, x, b, a) in enumerate(spots):
-        positions[i] = np.asarray(
-            [
-                int(contains_tissue((a, b), d, gscale, thresh)),
-                y,
-                x,
-                b,
-                a,
-            ]
-        )
+        tissue_flag = contains_tissue((a, b), d / 2, gscale, thresh)
+        positions[i] = cp.array([tissue_flag, y, x, b, a])
 
     # structure into dataframe to save as csv
-    df = pd.DataFrame(
+    df = cudf.DataFrame(
         positions,
         columns=[
             "in_tissue",
@@ -214,46 +221,37 @@ def get_tissue_positions(
     return df
 
 
-def locs_from_tissue_positions(
-    tissue_positions: pd.DataFrame, out_dir: str
-) -> None:
-    """
-    Converts a tissue positions matrix into the locs matrix expected
-    by iStar.
-
-    Parameters
-    ----------
-    tissue_positions : pd.DataFrame
-        The tissue positions matrix
-    """
-    df = tissue_positions[["pxl_col_in_fullres", "pxl_row_in_fullres"]].copy()
-    df.rename(
-        columns={
-            "pxl_col_in_fullres": "x",
-            "pxl_row_in_fullres": "y",
-        },
-        inplace=True,
-    )
-    df["spot"] = (
-        tissue_positions["array_row"].astype(str)
-        + "x"
-        + tissue_positions["array_col"].astype(str)
-    )
-    df = (
-        df[["spot", "x", "y"]]
-        .where(tissue_positions["in_tissue"] == 1)
-        .dropna()
-    )
-    df.to_csv(f"{out_dir}/locs-raw.tsv", index=False, sep="\t")
-
-
 def visualize(
-    tissue_positions: pd.DataFrame,
+    tissue_positions: cudf.DataFrame,
     img: str | TiffFile,
     out_dir: str,
     radius: float,
     max_width: int = 2000,
-):
+) -> None:
+    """
+    Visualizes the tissue positions on the HE image, saving the output
+    as a PNG file.
+
+    Parameters
+    ----------
+    tissue_positions : cudf.DataFrame
+        A DataFrame containing the tissue positions matrix with columns
+        "in_tissue", "array_row", "array_col", "pxl_row_in_fullres",
+        "pxl_col_in_fullres"
+
+    img : str | TiffFile
+        The path to the HE image or a TiffFile object containing the HE
+        image data
+
+    out_dir : str
+        The directory to save the visualization to
+
+    radius : float
+        The radius of the spots in pixels
+
+    max_width : int, optional
+        The maximum width of the output image, by default 2000
+    """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
     from PIL import Image
@@ -304,42 +302,80 @@ def visualize(
         )
         ax.add_patch(c)
 
-    plt.savefig(f"{out_dir}/vis.png", dpi=300)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/vis.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
 
-def get_radius_in_px(mpp: float, r_in_um: float, out_dir: str) -> float:
-    r_in_px = r_in_um / mpp
+def run(d: float, dist: float, img_path: str, out_dir: str) -> None:
+    """
+    Runs the tissue positions extraction and visualization for
+    hexagonal grids.
 
-    with open(f"{out_dir}/radius-raw.txt", "w") as f:
-        f.write(str(r_in_px))
+    Parameters
+    ----------
+    d : float
+        The diameter of the spots, in microns/um. For Visium this is 55
 
-    return r_in_px
+    dist : float
+        The distance between spot centers, in microns/um. For Visium
+        this is 100
 
+    img_path : str
+        The path to the HE image file
 
-def get_mpp(tif: TiffFile, out_dir: str) -> float:
-    # get the scale factor to convert px/unit to um/px
-    scalef = SCALE_FACTORS[tif.pages[0].tags["ResolutionUnit"].value]
+    out_dir : str
+        The directory to save the output files to
+    """
+    import gc
 
-    # XResolution is px per units in a (px, units) tuple
-    mpp = (
-        tif.pages[0].tags["XResolution"].value[1]  # units
-        / tif.pages[0].tags["XResolution"].value[0]  # px
-        * scalef
-    )
+    Image.MAX_IMAGE_PIXELS = None
 
-    # correct for errors in image metadata
-    if mpp < 0.1:
-        mpp *= 10
+    with TiffFile(img_path) as slide:
+        img = Image.fromarray(slide.asarray(0))
+        img.save(f"{out_dir}/he-raw.png")
+        del img
+        gc.collect()
 
-    with open(f"{out_dir}/pixel-size-raw.txt", "w") as f:
-        f.write(str(mpp))
+        # convert d and dist to pixels
+        d_in_um = d
 
-    return mpp
+        um_per_px = get_mpp(slide, out_dir)
+        r_in_px = get_radius_in_px(um_per_px, d_in_um / 2, out_dir)
+
+        distance_in_um = dist
+        distance_in_px = distance_in_um / um_per_px
+
+        # generate the tissue positions dataframe
+        print("Getting tissue positions")
+        tp = get_tissue_positions(
+            r_in_px * 2,
+            distance_in_px,
+            cp.asarray(slide.asarray(0)),
+            out_dir,
+        )
+
+        # generate the locs dataframe required for iSTAR
+        print("Building locs dataframe")
+        locs_from_tissue_positions(tp, out_dir)
+
+        # visualize the spots on the HE image
+        try:
+            print("Visualizing")
+            visualize(tp, slide, out_dir, r_in_px)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     sample_ids = ["TENX111", "TENX114", "TENX147", "TENX148", "TENX149"]
-    excl = {"TENX111", "TENX114", "TENX147"}
+    # excl = {"TENX114", "TENX147", "TENX148", "TENX149"}
+    excl = {}
+
+    Image.MAX_IMAGE_PIXELS = None
 
     for sample_id in sample_ids:
         if sample_id in excl:
@@ -352,6 +388,9 @@ if __name__ == "__main__":
         with TiffFile(
             f"/opt/gpudata/sjne/HEST/data/wsis/{sample_id}.tif"
         ) as slide:
+            img = Image.fromarray(slide.asarray(0))
+            img.save(f"{sample_id}/he-raw.png")
+
             d_in_um = 55
 
             um_per_px = get_mpp(slide, sample_id)
@@ -364,14 +403,14 @@ if __name__ == "__main__":
             tp = get_tissue_positions(
                 r_in_px * 2,
                 distance_in_px,
-                np.asarray(slide.asarray(0)),
+                cp.asarray(slide.asarray(0)),
                 sample_id,
             )
 
             print("Building locs dataframe")
             locs_from_tissue_positions(tp, sample_id)
 
-            # tp = pd.read_csv(f"{sample_id}/tissue_positions.csv")
+            # tp = cudf.read_csv(f"{sample_id}/tissue_positions.csv")
 
             try:
                 print("Visualizing")
