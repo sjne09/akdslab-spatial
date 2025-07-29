@@ -1,7 +1,6 @@
+import cudf
 import shapely
 from tifffile import RESUNIT, TiffFile
-
-import cudf as pd
 
 SCALE_FACTORS = {
     RESUNIT.INCH: 25.4e3,
@@ -73,7 +72,7 @@ def get_mpp(tif: TiffFile, out_dir: str) -> float:
 
 
 def locs_from_tissue_positions(
-    tissue_positions: pd.DataFrame, out_dir: str
+    tissue_positions: cudf.DataFrame, out_dir: str
 ) -> None:
     """
     Converts a tissue positions matrix into the locs matrix expected
@@ -81,7 +80,7 @@ def locs_from_tissue_positions(
 
     Parameters
     ----------
-    tissue_positions : pd.DataFrame
+    tissue_positions : cudf.DataFrame
         The tissue positions matrix
 
     out_dir : str

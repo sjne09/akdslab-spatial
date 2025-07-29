@@ -1,9 +1,11 @@
 import pickle
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from loguru import logger
 from PIL import Image
 
 
@@ -40,13 +42,14 @@ def get_counts_matrix(
     counts_array = np.zeros(mask.shape)
     for spot_id in counts.index:
         # unpack the index to get coords, which are 'RxC'
-        spot_row, spot_col = map(lambda x: int(x) - 1, spot_id.split("x"))
+        spot_row, spot_col = map(lambda x: int(x), spot_id.split("x"))
 
         # ignore index OOB
         try:
             counts_array[spot_row, spot_col] = counts[spot_id]
         except IndexError:
             continue
+
     counts_array[~mask] = np.nan
 
     # min-max normalize
@@ -57,7 +60,7 @@ def get_counts_matrix(
     return counts_array
 
 
-def plot_counts(counts: np.ndarray, mask: np.ndarray) -> Image:
+def plot_counts(counts: np.ndarray, mask: np.ndarray) -> Image.Image:
     """
     Visualizes the counts matrix as an image.
 
@@ -78,7 +81,7 @@ def plot_counts(counts: np.ndarray, mask: np.ndarray) -> Image:
     """
     cmap = plt.get_cmap("turbo")
 
-    # only take the first three channels
+    # RGB
     heatmap = cmap(counts)[..., :3]
 
     # set masked out areas to white
@@ -120,7 +123,7 @@ def process_sample(
     """
     for gene in counts.columns:
         gene_counts = get_counts_matrix(
-            counts=counts[gene], mask=mask, normalize=True
+            counts=counts[gene], mask=mask, normalize=False
         )
         plot = plot_counts(counts=gene_counts, mask=mask)
 
@@ -131,34 +134,90 @@ def process_sample(
         plot.close()
 
 
+def process_single_sample(sample_path: Path) -> None:
+    """
+    Process a single sample - designed to be called by multiprocessing.
+
+    Parameters
+    ----------
+    sample_path : Path
+        Path to the sample directory
+    """
+    logger.info(f"Processing {sample_path.parent}.{sample_path.name}")
+
+    cnts_super_dir = Path(sample_path / "cnts-super")
+    cnts_super_dir.mkdir(exist_ok=True)
+
+    cnts_super_plots_dir = Path(sample_path / "cnts-super-plots")
+    cnts_super_plots_dir.mkdir(exist_ok=True)
+
+    counts_df = pd.read_csv(
+        sample_path / "cnts.tsv", sep="\t", index_col="spot_id"
+    )
+
+    with Image.open(sample_path / "mask-small.png") as img:
+        mask = np.array(img)
+
+    process_sample(
+        counts=counts_df,
+        mask=mask,
+        plot_outdir=cnts_super_plots_dir,
+        vector_outdir=cnts_super_dir,
+    )
+    logger.info(f"Done processing {sample_path.parent}.{sample_path.name}")
+
+
 if __name__ == "__main__":
     base_dir = Path("/opt/gpudata/sjne/data_for_istar")
     dirs = [d for d in base_dir.iterdir() if d.name.startswith("sq")]
 
+    # Collect all sample paths
+    all_samples = []
     for d in dirs:
-        print(f"Beginning processing {d.name}")
-
         for sample in d.iterdir():
-            print(f"Processing {sample.name}")
+            all_samples.append(sample)
 
-            cnts_super_dir = Path(sample / "cnts-super")
-            cnts_super_dir.mkdir(exist_ok=True)
+    # use multiprocessing to process samples in parallel
+    num_processes = max(1, int(cpu_count() * 0.50))
 
-            cnts_super_plots_dir = Path(sample / "cnts-super-plots")
-            cnts_super_plots_dir.mkdir(exist_ok=True)
+    logger.info(
+        f"Processing {len(all_samples)} samples using {num_processes} processes"
+    )
 
-            counts_df = pd.read_csv(
-                sample / "cnts.tsv", sep="\t", index_col="spot_id"
-            )
+    with Pool(processes=num_processes) as pool:
+        pool.map(process_single_sample, all_samples)
 
-            with Image.open(sample / "mask-small.png") as img:
-                mask = np.array(img)
+    logger.info("Done processing all samples")
 
-            process_sample(
-                counts=counts_df,
-                mask=mask,
-                plot_outdir=cnts_super_plots_dir,
-                vector_outdir=cnts_super_dir,
-            )
 
-        print(f"Done processing {d.name}\n")
+# if __name__ == "__main__":
+#     base_dir = Path("/opt/gpudata/sjne/data_for_istar")
+#     dirs = [d for d in base_dir.iterdir() if d.name.startswith("sq")]
+
+#     for d in dirs:
+#         print(f"Beginning processing {d.name}")
+
+#         for sample in d.iterdir():
+#             print(f"Processing {sample.name}")
+
+#             cnts_super_dir = Path(sample / "cnts-super")
+#             cnts_super_dir.mkdir(exist_ok=True)
+
+#             cnts_super_plots_dir = Path(sample / "cnts-super-plots")
+#             cnts_super_plots_dir.mkdir(exist_ok=True)
+
+#             counts_df = pd.read_csv(
+#                 sample / "cnts.tsv", sep="\t", index_col="spot_id"
+#             )
+
+#             with Image.open(sample / "mask-small.png") as img:
+#                 mask = np.array(img)
+
+#             process_sample(
+#                 counts=counts_df,
+#                 mask=mask,
+#                 plot_outdir=cnts_super_plots_dir,
+#                 vector_outdir=cnts_super_dir,
+#             )
+
+#         print(f"Done processing {d.name}\n")
